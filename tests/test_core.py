@@ -11,6 +11,7 @@ import stat
 from types import SimpleNamespace
 import tempfile
 import threading
+import time
 import unittest
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -2476,6 +2477,13 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
             ram_available=12 * GiB, swap_total=0, swap_used=0)
         self.addCleanup(sampler.stop)
 
+    async def wait_for_snapshots(self, app, pilot, count, timeout=10.0):
+        # Polling runs in a worker thread; a slow CI runner can take well over a second for the first sample.
+        deadline = time.monotonic() + timeout
+        while len(app.snapshots) < count and time.monotonic() < deadline:
+            await pilot.pause(0.05)
+        self.assertEqual(len(app.snapshots), count)
+
     def chart_text(self, app):
         widget = app.query_one("#charts", Static)
         output = io.StringIO()
@@ -2983,13 +2991,12 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
             factory.side_effect = collectors
             app = GpuTaskManager(interval=0.05)
             async with app.run_test(size=(140, 42)) as pilot:
-                await pilot.pause(0.8)
-                self.assertEqual(len(app.snapshots), 2)
+                await self.wait_for_snapshots(app, pilot, 2)
                 self.assertEqual(factory.call_args_list[0].args, (0,))
                 self.assertEqual(factory.call_args_list[1].args, (1,))
                 self.assertEqual(factory.call_args_list[0].kwargs["scan_budget"], 0.075)
             for collector, event in zip(collectors, closed):
-                self.assertTrue(await asyncio.to_thread(event.wait, 2))
+                self.assertTrue(await asyncio.to_thread(event.wait, 10))
                 collector.close.assert_called_once()
 
     async def test_explicit_gpu_keeps_single_device_layout(self):
@@ -3003,11 +3010,10 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
             factory.return_value.close.side_effect = closed.set
             app = GpuTaskManager(gpu_index=1, interval=0.05)
             async with app.run_test(size=(140, 42)) as pilot:
-                await pilot.pause(0.8)
-                self.assertEqual(len(app.snapshots), 1)
+                await self.wait_for_snapshots(app, pilot, 1)
                 self.assertNotIn("GPU", app.query_one("#procs").columns)
                 self.assertEqual(factory.call_args.args, (1,))
-            self.assertTrue(await asyncio.to_thread(closed.wait, 2))
+            self.assertTrue(await asyncio.to_thread(closed.wait, 10))
             factory.return_value.close.assert_called_once()
 
     async def test_multi_gpu_wsl_does_not_claim_process_device_ownership(self):
