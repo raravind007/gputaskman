@@ -108,6 +108,17 @@ class CliTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 0)
         self.assertIn("implies --once", output.getvalue())
 
+    def test_version_prints_installed_version_without_a_gpu(self):
+        from importlib.metadata import version
+        output = io.StringIO()
+        with patch("sys.argv", ["gputaskman", "--version"]), patch("gputaskman.cli._check_platform") as check, \
+                contextlib.redirect_stdout(output):
+            with self.assertRaises(SystemExit) as error:
+                main()
+        self.assertEqual(error.exception.code, 0)
+        self.assertEqual(output.getvalue().strip(), f"gputaskman {version('gputaskman')}")
+        check.assert_not_called()
+
     def test_json_implies_once(self):
         output = io.StringIO()
         with patch("sys.argv", ["gputaskman", "--json"]), patch("gputaskman.cli.time.sleep"):
