@@ -42,7 +42,9 @@ gputaskman
 Works on Windows, Linux/WSL, and macOS with Python 3.11+ and the supported GPU/driver
 configuration described below. Both installers keep the app in an isolated environment.
 The shorter `gtm` command is also available. Upgrade with `uv tool upgrade gputaskman`
-or `pipx upgrade gputaskman`. For Windows without Python, use the portable download below.
+or `pipx upgrade gputaskman`; `gputaskman --version` shows what you have, and the TUI shows it
+under the GPU panel. Each [release](https://github.com/shanselman/gputaskman/releases) lists what
+changed. For Windows without Python, use the portable download below.
 
 ## Portable Windows download
 

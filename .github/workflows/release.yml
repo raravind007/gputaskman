@@ -165,4 +165,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
-        run: gh release create "$RELEASE_TAG" release-assets/* --verify-tag --generate-notes --title "GPU Task Manager $RELEASE_TAG"
+          UPGRADE_NOTES: >-
+            **Upgrade:** `uv tool upgrade gputaskman` or `pipx upgrade gputaskman`.
+            Portable builds: download the archive for your platform below and replace the old folder.
+            Check what you have with `gputaskman --version`.
+        run: gh release create "$RELEASE_TAG" release-assets/* --verify-tag --generate-notes --notes "$UPGRADE_NOTES" --title "GPU Task Manager $RELEASE_TAG"

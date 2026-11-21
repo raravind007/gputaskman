@@ -7,6 +7,8 @@ import math
 import sys
 import time
 
+from . import __version__
+
 
 def diff_main(argv: list[str]) -> None:
     import json
@@ -149,6 +151,7 @@ def main() -> None:
     ap.add_argument("--no-system", action="store_true",
                     help="don't sample system RAM/CPU: no TUI panel or RAM/CPU%% columns, no system section in --once/--json")
     ap.add_argument("-i", "--interval", type=float, default=1.0, help="refresh seconds (default 1)")
+    ap.add_argument("--version", action="version", version=f"gputaskman {__version__}")
     args = ap.parse_args()
     if args.gpu is not None and args.gpu < 0:
         ap.error("--gpu must be a non-negative index")

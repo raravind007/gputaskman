@@ -17,6 +17,7 @@ from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Markdown, Select, Static
 from textual.worker import get_current_worker
 
+from . import __version__
 from .collector import BACKEND, Collector, ProcRow, Snapshot, enumerate_adapters, ordered_adapters
 from .host import HostSample, HostSampler
 from .llm import LOG_HISTORY_LABEL, gb, log_buffer_text, redact_cmdline, server_gauge_text, vllm_rate_text
@@ -323,6 +324,7 @@ class GpuTaskManager(App):
             cols += ["RAM", "CPU%"]
         for col in (*cols, "What's inside"):
             t.add_column(col, key=col)
+        self.query_one("#device", Static).border_subtitle = f"v{__version__}"
         t.focus()
         self.poll()
 
