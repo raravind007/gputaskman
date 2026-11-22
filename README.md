@@ -957,6 +957,7 @@ Playback starts paused on the first snapshot.
 | Space | Play / pause |
 | Right / Left | Next / previous snapshot |
 | Home / End | First / last snapshot |
+| `p` | Peak GPU memory: jump to that frame in this run and pause |
 | `+` / `-` | Faster / slower: 0.5×, 1×, 2×, 4× (starts at 1×) |
 | `r` | Restart from the first snapshot and play |
 | `q` | Quit |

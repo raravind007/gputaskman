@@ -14,7 +14,7 @@ from textual.widgets import DataTable, Static
 
 from gputaskman.cli import main
 from gputaskman.replay import (FIXED_INTERVAL, Playback, RecordingError, describe, load_recording,
-                               process_rows)
+                               peak_memory_index, process_rows)
 
 GiB = 1 << 30
 
@@ -275,6 +275,36 @@ class PlaybackTests(unittest.TestCase):
         self.assertIsNone(play.delay())
 
 
+class PeakTests(unittest.TestCase):
+    def test_a_tie_uses_the_earliest_frame_and_ignores_other_memory(self):
+        frames = [snap(0, vram_used=4 * GiB, processes=[proc(name="first")]),
+                  snap(1, vram_used=GiB, shared_used=20 * GiB, processes=[proc(name="busy", vram=20 * GiB)],
+                       device={"util_gpu": 99.0}),
+                  snap(2, vram_used=4 * GiB, processes=[proc(name="later")])]
+        self.assertEqual(peak_memory_index(frames, 2), 0)
+
+    def test_missing_readings_are_skipped_and_a_recorded_zero_counts(self):
+        frames = [snap(0, vram_used=None, shared_used=9 * GiB, processes=[proc(vram=9 * GiB)]),
+                  snap(1, vram_used=True), snap(2, vram_used="8"), snap(3, vram_used=float("nan")),
+                  snap(4, vram_used=float("inf")), snap(5, vram_used=10**400),
+                  snap(6, vram_used=0, processes=[proc(name="zero")])]
+        self.assertEqual(peak_memory_index(frames, 0), 6)
+
+    def test_a_later_run_with_a_higher_peak_is_not_used(self):
+        # summary's gap: 500 starts a second run.
+        frames = [snap(0, vram_used=GiB, processes=[proc(name="low")]),
+                  snap(1, vram_used=2 * GiB, processes=[proc(name="peak")]),
+                  snap(2, vram_used=GiB), snap(3, vram_used=GiB),
+                  snap(500, vram_used=8 * GiB, processes=[proc(name="other")]),
+                  snap(501, vram_used=GiB), snap(502, vram_used=GiB)]
+        self.assertEqual(peak_memory_index(frames, 0), 1)
+        self.assertEqual(peak_memory_index(frames, 4), 4)
+
+    def test_no_reading_has_no_frame(self):
+        frames = [snap(0, vram_used=None), snap(1, vram_used=float("nan"))]
+        self.assertIsNone(peak_memory_index(frames, 1))
+
+
 class DisplayTests(unittest.TestCase):
     def test_missing_metrics_stay_unavailable_and_zero_stays_zero(self):
         body = snap(processes=[proc(vram=None, gpu_pct=None, shared_bytes=None)])
@@ -528,6 +558,70 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                 app._tick()
                 self.assertIn("Snapshot:", self.text(app))
             recording.close()
+
+    async def test_p_jumps_to_peak_gpu_memory_and_space_resumes_there(self):
+        from gputaskman.replay import ReplayApp
+
+        write(self.path, [snap(0.0, vram_used=GiB, processes=[proc(1, "first")]),
+                          snap(1.0, vram_used=5 * GiB, processes=[proc(2, "peak")]),
+                          snap(2.0, vram_used=2 * GiB, processes=[proc(3, "later")])])
+        app = ReplayApp(load_recording(self.path))
+        self.addCleanup(app.recording.close)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            self.assertEqual(app.playback.index, 1)
+            self.assertFalse(app.playback.playing)
+            self.assertIn("Snapshot: 2 / 3", self.text(app))
+            self.assertIn("PAUSED", self.text(app))
+            self.assertEqual(app.query_one("#procs", DataTable).get_cell("0", "Process").plain, "peak")
+            await pilot.press("space")
+            await pilot.pause()
+            self.assertTrue(app.playback.playing)
+            self.assertEqual(app.playback.index, 1)
+            self.assertAlmostEqual(app.scheduled_delay, 1.0)
+
+    async def test_p_while_playing_pauses_on_the_peak_frame(self):
+        from gputaskman.replay import ReplayApp
+
+        write(self.path, [snap(0.0, vram_used=GiB, processes=[proc(1, "first")]),
+                          snap(10.0, vram_used=5 * GiB, processes=[proc(2, "peak")]),
+                          snap(20.0, vram_used=2 * GiB, processes=[proc(3, "later")])])
+        app = ReplayApp(load_recording(self.path))
+        self.addCleanup(app.recording.close)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("space")
+            await pilot.pause()
+            self.assertTrue(app.playback.playing)
+            await pilot.press("p")
+            await pilot.pause()
+            self.assertEqual(app.playback.index, 1)
+            self.assertFalse(app.playback.playing)
+            self.assertEqual(app.query_one("#procs", DataTable).get_cell("0", "Process").plain, "peak")
+            await pilot.pause()
+            self.assertEqual(app.playback.index, 1)
+
+    async def test_p_with_no_gpu_memory_reading_stays_put(self):
+        from gputaskman.replay import ReplayApp
+
+        write(self.path, [snap(0.0, vram_used=None, processes=[proc(1, "first")]),
+                          snap(1.0, vram_used=float("nan"), processes=[proc(2, "second")])])
+        app = ReplayApp(load_recording(self.path))
+        self.addCleanup(app.recording.close)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("space")
+            await pilot.pause()
+            self.assertTrue(app.playback.playing)
+            self.assertEqual(app.playback.index, 0)
+            await pilot.press("p")
+            await pilot.pause()
+            self.assertEqual(app.playback.index, 0)
+            self.assertTrue(app.playback.playing)
+            self.assertIn("No recorded GPU memory in this run.", self.text(app))
+            self.assertEqual(app.query_one("#procs", DataTable).get_cell("0", "Process").plain, "first")
 
 
 class CliTests(unittest.TestCase):

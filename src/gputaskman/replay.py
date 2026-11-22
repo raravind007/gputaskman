@@ -27,6 +27,7 @@ from .dxgi import VENDORS
 from .llm import gb
 from .nvml import format_metric
 from .report import DRM_NOTES, INFERRED_NOTE, ORDER_NOTE, vram_mark
+from .summary import METRICS, split_runs
 
 SPEEDS = (0.5, 1.0, 2.0, 4.0)
 FIXED_INTERVAL = 1.0  # stand-in when `taken` cannot drive playback; not a recovered sample period
@@ -38,6 +39,8 @@ UNTIMED = ("Playback uses 1 second per snapshot at 1x because recorded timestamp
 _TRAILING = "skipped a trailing incomplete line ({}); an interrupted recording can end that way"
 _INCOMPLETE = ("invalid JSON", "invalid text")
 _BAD_TEXT = object()  # a UTF-16 line with a code unit that does not decode
+_VRAM_USED = next(reader for key, _label, _kind, reader in METRICS if key == "vram_used")
+_NO_PEAK = "No recorded GPU memory in this run."
 
 
 class RecordingError(ValueError):
@@ -184,6 +187,14 @@ class Playback:
         self._mark = None
         self.playing = self.count > 1
 
+    def pause_at(self, index: int) -> None:
+        """Show this snapshot and pause. The snapshot already on screen pauses too."""
+        self._consume()
+        self._goto(index)
+        self.playing = False
+        self._remaining = None
+        self._mark = None
+
     def gap(self) -> float | None:
         """Unscaled seconds between this snapshot and the next, or None at the end."""
         if self.index >= self.count - 1:
@@ -272,7 +283,35 @@ def run_replay(recording: Recording) -> None:
     ReplayApp(recording).run()
 
 
-def describe(recording: Recording, playback: Playback, snapshot: dict, *, width: int = 40) -> str:
+def peak_memory_index(snapshots: list[dict], index: int) -> int | None:
+    """Earliest frame in this frame's summary run with the highest recorded ``vram_used``, or None."""
+    kept: list[dict] = []
+    positions: list[int] = []
+    for position, snapshot in enumerate(snapshots):
+        # summary.load keeps a line only when it has a process list and a finite taken.
+        if isinstance(snapshot.get("processes"), list) and _number(snapshot.get("taken")) is not None:
+            kept.append(snapshot)
+            positions.append(position)
+    if index not in positions:
+        return None
+    where = {id(snapshot): position for snapshot, position in zip(kept, positions)}
+    for run in split_runs(kept):
+        if not any(where[id(snapshot)] == index for snapshot in run):
+            continue
+        best: float | None = None
+        best_at: int | None = None
+        for snapshot in run:
+            value = _number(_VRAM_USED(snapshot))
+            if value is None or (best is not None and value <= best):
+                continue
+            best = value
+            best_at = where[id(snapshot)]
+        return best_at
+    return None
+
+
+def describe(recording: Recording, playback: Playback, snapshot: dict, *, width: int = 40,
+             notice: str = "") -> str:
     """The status block for one snapshot. File strings are included as plain text."""
     lines = [
         "GPU Session Replay",
@@ -280,6 +319,10 @@ def describe(recording: Recording, playback: Playback, snapshot: dict, *, width:
         "",
         f"Snapshot: {playback.index + 1:,} / {playback.count:,}",
         f"Status: {_status(playback)}",
+    ]
+    if notice:
+        lines.append("Notice: " + _plain(notice))
+    lines += [
         f"Speed: {playback.speed:.1f}x",
         f"Timing: {_timing(recording, playback)}",
         f"Recorded: {_taken_text(snapshot.get('taken'))}",
@@ -310,7 +353,8 @@ def describe(recording: Recording, playback: Playback, snapshot: dict, *, width:
     for note in _notes(snapshot):
         lines.append(_plain(note))
     lines.append("")
-    lines.append("Space: Play/Pause | ←/→: Step | Home/End: Ends | +/-: Speed | r: Restart | q: Quit")
+    lines.append("Space: Play/Pause | ←/→: Step | Home/End: Ends | p: Peak GPU memory | "
+                 "+/-: Speed | r: Restart | q: Quit")
     return "\n".join(lines)
 
 
@@ -365,6 +409,7 @@ class ReplayApp(App):
         Binding("left", "previous", "Previous", priority=True),
         Binding("home", "first", "First", priority=True),
         Binding("end", "last", "Last", priority=True),
+        Binding("p", "peak_memory", "Peak GPU memory", priority=True),
         Binding("plus,+", "faster", "Faster", priority=True),
         Binding("minus,-", "slower", "Slower", priority=True),
         Binding("r", "restart", "Restart", priority=True),
@@ -380,6 +425,7 @@ class ReplayApp(App):
         self._mounted = False
         self._drawing = False
         self.scheduled_delay: float | None = None
+        self._notice = ""
 
     def compose(self) -> ComposeResult:
         yield Static(id="replay", markup=False)
@@ -420,7 +466,7 @@ class ReplayApp(App):
             width = 40
             if self.size.width:
                 width = max(10, min(40, self.size.width - 4))
-            text = describe(self.recording, self.playback, snapshot, width=width)
+            text = describe(self.recording, self.playback, snapshot, width=width, notice=self._notice)
             rows = process_rows(snapshot)[0]
         except Exception as error:  # one unreadable or unrenderable snapshot must not end the replay
             self.playback.playing = False
@@ -433,39 +479,48 @@ class ReplayApp(App):
         self._fill_table(rows)
         self._arm()
 
-    def action_play_pause(self) -> None:
-        self.playback.toggle()
+    def _move(self, move) -> None:
+        self._notice = ""
+        move()
         self.refresh_view()
+
+    def action_play_pause(self) -> None:
+        self._move(self.playback.toggle)
 
     def action_next(self) -> None:
-        self.playback.step(1)
-        self.refresh_view()
+        self._move(lambda: self.playback.step(1))
 
     def action_previous(self) -> None:
-        self.playback.step(-1)
-        self.refresh_view()
+        self._move(lambda: self.playback.step(-1))
 
     def action_first(self) -> None:
-        self.playback.first()
-        self.refresh_view()
+        self._move(self.playback.first)
 
     def action_last(self) -> None:
-        self.playback.last()
-        self.refresh_view()
+        self._move(self.playback.last)
 
     def action_faster(self) -> None:
-        self.playback.faster()
-        self.refresh_view()
+        self._move(self.playback.faster)
 
     def action_slower(self) -> None:
-        self.playback.slower()
-        self.refresh_view()
+        self._move(self.playback.slower)
 
     def action_restart(self) -> None:
-        self.playback.restart()
+        self._move(self.playback.restart)
+
+    def action_peak_memory(self) -> None:
+        snapshots = [self.recording.snapshot(i) for i in range(self.recording.count)]
+        target = peak_memory_index(snapshots, self.playback.index)
+        if target is None:
+            self._notice = _NO_PEAK
+            self.refresh_view()
+            return
+        self._notice = ""
+        self.playback.pause_at(target)
         self.refresh_view()
 
     def _tick(self) -> None:
+        self._notice = ""
         self._timer = None
         if not self.is_running:
             return
