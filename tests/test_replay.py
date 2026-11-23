@@ -304,6 +304,16 @@ class PeakTests(unittest.TestCase):
         frames = [snap(0, vram_used=None), snap(1, vram_used=float("nan"))]
         self.assertIsNone(peak_memory_index(frames, 1))
 
+    def test_loaded_frames_keep_what_the_search_needs(self):
+        other = dict(snap()["adapter"], vendor_id=0x1002)
+        records = [snap(0, vram_used=GiB), snap(1, vram_used=2 * GiB), snap(2, vram_used=9 * GiB, adapter=other)]
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "r.jsonl")
+            write(path, records)
+            with load_recording(path) as recording:
+                self.assertEqual(peak_memory_index(recording.frames, 0), 1)
+                self.assertEqual(peak_memory_index(recording.frames, 2), 2)
+
 
 class DisplayTests(unittest.TestCase):
     def test_missing_metrics_stay_unavailable_and_zero_stays_zero(self):
@@ -622,6 +632,21 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(app.playback.playing)
             self.assertIn("No recorded GPU memory in this run.", self.text(app))
             self.assertEqual(app.query_one("#procs", DataTable).get_cell("0", "Process").plain, "first")
+
+    async def test_p_on_a_snapshot_without_a_time_says_so(self):
+        from gputaskman.replay import ReplayApp
+
+        write(self.path, [snap(0.0, vram_used=5 * GiB), snap(None, vram_used=10 * GiB),
+                          snap(2.0, vram_used=8 * GiB)])
+        app = ReplayApp(load_recording(self.path))
+        self.addCleanup(app.recording.close)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.press("p")
+            await pilot.pause()
+            self.assertEqual(app.playback.index, 1)
+            self.assertIn("no recorded time, so it is not part of a run", self.text(app))
 
 
 class CliTests(unittest.TestCase):

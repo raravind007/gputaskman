@@ -41,6 +41,7 @@ _INCOMPLETE = ("invalid JSON", "invalid text")
 _BAD_TEXT = object()  # a UTF-16 line with a code unit that does not decode
 _VRAM_USED = next(reader for key, _label, _kind, reader in METRICS if key == "vram_used")
 _NO_PEAK = "No recorded GPU memory in this run."
+_NO_TIME = "This snapshot has no recorded time, so it is not part of a run."
 
 
 class RecordingError(ValueError):
@@ -51,8 +52,10 @@ class Recording:
     """One opened JSON Lines recording. Snapshots are parsed when asked for, then discarded."""
 
     def __init__(self, path: str, spans: list[tuple[int, int]], taken: list[float | None], timed: bool,
-                 warnings: list[str], gpu_count: int, file, encoding: str, texts: list[str] | None = None) -> None:
+                 warnings: list[str], gpu_count: int, file, encoding: str, texts: list[str] | None = None,
+                 frames: list[dict] | None = None) -> None:
         self.path = path
+        self.frames = frames or []  # small per-snapshot stubs for the peak search; see _peak_stub
         self.spans = spans
         self.taken = taken
         self.timed = timed
@@ -509,10 +512,10 @@ class ReplayApp(App):
         self._move(self.playback.restart)
 
     def action_peak_memory(self) -> None:
-        snapshots = [self.recording.snapshot(i) for i in range(self.recording.count)]
-        target = peak_memory_index(snapshots, self.playback.index)
+        target = peak_memory_index(self.recording.frames, self.playback.index)
         if target is None:
-            self._notice = _NO_PEAK
+            untimed = _number(self.recording.frames[self.playback.index].get("taken")) is None
+            self._notice = _NO_TIME if untimed else _NO_PEAK
             self.refresh_view()
             return
         self._notice = ""
@@ -562,6 +565,7 @@ class ReplayApp(App):
 def _from_lines(path: str, lines, *, file, encoding: str, texts: list[str] | None = None) -> Recording:
     spans: list[tuple[int, int]] = []
     taken: list[float | None] = []
+    frames: list[dict] = []
     problems: list[tuple[int, str]] = []
     gpus: set[str] = set()
     line_no = 0
@@ -601,6 +605,7 @@ def _from_lines(path: str, lines, *, file, encoding: str, texts: list[str] | Non
         length = len(payload)
         spans.append((start, length))
         taken.append(_number(data.get("taken")))
+        frames.append(_peak_stub(data))
         gpus.add(_gpu_key(data))
     warnings = _warnings(problems, last_nonblank)
     if not spans:
@@ -611,7 +616,23 @@ def _from_lines(path: str, lines, *, file, encoding: str, texts: list[str] | Non
     timed = _timed(taken)
     if len(spans) >= 2 and not timed:
         warnings.append(UNTIMED)
-    return Recording(path, spans, taken, timed, warnings, len(gpus), file, encoding, texts)
+    return Recording(path, spans, taken, timed, warnings, len(gpus), file, encoding, texts, frames)
+
+
+def _peak_stub(data: dict) -> dict:
+    """The fields peak_memory_index reads (summary's keep test, split_runs, vram_used), so a key press
+    does not re-parse every snapshot. Update this if split_runs or adapter_identity read more."""
+    stub = {key: data[key] for key in ("taken", "gpu", "backend", "vram_used") if key in data}
+    adapter = data.get("adapter")
+    if isinstance(adapter, dict):
+        stub["adapter"] = {key: adapter[key] for key in ("vendor_id", "luid", "pci_address", "pci_domain")
+                           if key in adapter}
+    device = data.get("device")
+    if isinstance(device, dict) and "pci_bus" in device:
+        stub["device"] = {"pci_bus": device["pci_bus"]}
+    if isinstance(data.get("processes"), list):
+        stub["processes"] = []
+    return stub
 
 
 def _binary_lines(handle):
