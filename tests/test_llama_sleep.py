@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -114,6 +116,18 @@ class ReportTests(unittest.TestCase):
         self.assertIn("/metrics is skipped", notes(old)[0])
         plain, _ = probe(props(is_sleeping=False))
         self.assertEqual(notes(plain), [])
+
+    def test_sleeping_model_path_is_not_residency_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "x.gguf")
+            with open(path, "wb") as f:
+                f.write(b"GGUF")
+            d = ProcDetail(1, "llama-server")
+            with patch("gputaskman.llm.read_gguf", return_value=None):
+                awake = build_view(d, 0, 0, ServerInfo("llama-server", BASE, model_path=path, sleeping=False))
+                asleep = build_view(d, 0, 0, ServerInfo("llama-server", BASE, model_path=path, sleeping=True))
+            self.assertTrue(any("api" in f.sources for f in awake.files + awake.other_files))
+            self.assertFalse(any("api" in f.sources for f in asleep.files + asleep.other_files))
 
 
 if __name__ == "__main__":

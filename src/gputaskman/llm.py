@@ -782,8 +782,9 @@ def _merge_api(files: list[MappedModel], server: ServerInfo | None, host: Server
     """Mark files a runtime API also reports; return the API entries that matched this process."""
     matched: list[dict] = []
     # llama-server reports -m as it was typed, so a relative path belongs to the server's cwd, not ours.
+    # A sleeping server still reports its model_path, but has unloaded the model: that is not residency evidence.
     path = target_path(pid, server.model_path) if server and server.kind == "llama-server" and server.model_path \
-        else None
+        and not server.sleeping else None
     if path:
         key = file_key(path)
         hit = next((f for f in files if file_key(f.path) == key), None)
