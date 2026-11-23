@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from gputaskman.llm import ServerInfo, ServerProber, build_view, probe_server, sleep_idle_enabled
-from gputaskman.procinfo import ProcDetail
+from gputaskman.procinfo import MappedModel, ProcDetail
 from gputaskman.report import _server_dict
 
 BASE = "http://127.0.0.1:8080"
@@ -128,6 +128,40 @@ class ReportTests(unittest.TestCase):
                 asleep = build_view(d, 0, 0, ServerInfo("llama-server", BASE, model_path=path, sleeping=True))
             self.assertTrue(any("api" in f.sources for f in awake.files + awake.other_files))
             self.assertFalse(any("api" in f.sources for f in asleep.files + asleep.other_files))
+
+    def test_sleep_keeps_command_line_evidence_without_adding_api(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "x.gguf")
+            with open(path, "wb") as f:
+                f.write(b"GGUF")
+            d = ProcDetail(1, "llama-server", models=[MappedModel(path, 4, None, True, sources=["cmdline"], kind="LLM")])
+            with patch("gputaskman.llm.read_gguf", return_value=None):
+                view = build_view(d, 0, 0, ServerInfo("llama-server", BASE, model_path=path, sleeping=True))
+            sources = [f.sources for f in view.files + view.other_files if f.path == path]
+            self.assertEqual(sources, [["cmdline"]])
+            self.assertEqual(d.models[0].sources, ["cmdline"])  # cached process details stay untouched
+
+
+class WakeTests(unittest.TestCase):
+    def test_slots_polling_resumes_after_the_server_wakes(self):
+        # No --sleep-idle-seconds visible (e.g. set by environment): only the reported state gates /slots.
+        states = iter([True, False])
+        seen = []
+
+        def get(url, **kw):
+            path = url.removeprefix(BASE)
+            seen.append(path)
+            if path == "/props":
+                return props(is_sleeping=next(states), build_info="b12633-abc")
+            return {"/v1/models": {"data": [{"id": "x"}]}, "/slots": SLOTS, "/metrics": METRICS}[path]
+
+        prober = ServerProber()
+        with patch("gputaskman.llm._get", side_effect=get), patch("gputaskman.llm.time.time", side_effect=[0, 10]):
+            asleep = prober.get([8080])
+            awake = prober.get([8080])
+        self.assertIs(asleep.sleeping, True)
+        self.assertEqual((awake.sleeping, awake.slots_busy), (False, 1))
+        self.assertEqual(seen, ["/props", "/v1/models", "/props", "/slots", "/metrics"])
 
 
 if __name__ == "__main__":
