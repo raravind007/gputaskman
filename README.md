@@ -1243,6 +1243,18 @@ them runtime-reported for the server, not GPU-memory measurements. Running reque
 `/slots` when no valid processing gauge is available; `slots_busy` remains separately available.
 The new gauges have only been tested with fixture responses, not a live llama-server.
 
+llama-server can unload its model after `--sleep-idle-seconds` of inactivity, and it counts every
+`/slots` request as activity. While a llama-server reports `"is_sleeping": true` in `/props`, the probe
+sends only `/props` (plus `/v1/models` until the model is known), because `/slots` would reload the
+model; JSON shows `"sleeping": true` and the slot and gauge fields stay `null`. When the server's own
+command line sets `--sleep-idle-seconds` to 0 or more, `/slots` is never polled, so the idle timer can
+run out; `/metrics` is still read on llama.cpp b10519 and later (the build where it stopped counting as
+activity) and skipped on older builds or when `/props` reports no `build_info`. The inspector says
+which readings were skipped and why. A sleep timeout set through `LLAMA_ARG_SLEEP_IDLE_SECONDS` or a
+router preset can't be seen from outside the process, so those servers are still polled as before.
+`sleeping` is runtime-reported, and `null` when the server doesn't report it. This behavior has been
+tested with fixture responses based on llama.cpp's server code, not a live llama-server.
+
 The following `processes[].llm.server` JSON fields are shared by llama-server and vLLM, including in
 recordings. They are never added to measured memory totals:
 

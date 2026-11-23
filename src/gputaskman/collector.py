@@ -15,7 +15,7 @@ from .adl import Adl
 from .dxgi import (VENDOR_AMD, VENDOR_NVIDIA, VENDOR_HUAWEI, VENDOR_INTEL, VENDOR_QUALCOMM, Adapter,
                   adapter_driver_version)
 from .handy import HandyEvidence, inspect_handy
-from .llm import LlmView, ServerProber, api_key, build_view, gb, ollama_log_path
+from .llm import LlmView, ServerProber, api_key, build_view, gb, ollama_log_path, sleep_idle_enabled
 from . import nvml as nvml_mod
 from .nvml import Nvml, NvDevice
 from .pdh import ENGINE_UNAVAILABLE_REASON, ProcGpu
@@ -565,8 +565,12 @@ class Collector:
                 ports, parent_ports = [], []  # two possible server processes: do not pick one
             parent_origin = ("parent", tuple((pid, self.inspector.get(pid).create_time)
                                             for pid in row.detail.parents or []))
-            own = self.prober.get(ports, key, kind=kind, origin=own_origin)
-            host = self.prober.get(parent_ports, kind=kind, origin=parent_origin)
+            # A llama-server with --sleep-idle-seconds must not see /slots polls, or it never unloads (#141).
+            own_sleep = sleep_idle_enabled(row.detail.cmdline)
+            parent_sleep = any(sleep_idle_enabled(self.inspector.get(pid).cmdline)
+                               for pid in row.detail.parents or [])
+            own = self.prober.get(ports, key, kind=kind, origin=own_origin, sleep_idle=own_sleep)
+            host = self.prober.get(parent_ports, kind=kind, origin=parent_origin, sleep_idle=parent_sleep)
             log = ollama_log_path() if row in ollama_runners and len(ollama_runners) == 1 else None
             # On an APU, GTT is the GPU's ordinary memory (often most of it), not spill: count it as held memory.
             unproven_owner = snap.backend == "nvml" and bool(row.gpu.inferred_by)

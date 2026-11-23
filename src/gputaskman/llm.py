@@ -39,6 +39,24 @@ _FLAGS = {
 _BOOL_FLAGS = {"--no-mmap": "no_mmap"}
 
 
+def sleep_idle_enabled(cmd: list[str]) -> bool:
+    """True when llama-server's own command line turns on --sleep-idle-seconds (0 or more; -1 disables it).
+
+    The last occurrence wins, as in llama.cpp's parser. LLAMA_ARG_SLEEP_IDLE_SECONDS and router presets
+    can't be seen from outside the process, so those configurations read as off.
+    """
+    value = None
+    for i, arg in enumerate(cmd):
+        if arg == "--sleep-idle-seconds" and i + 1 < len(cmd):
+            value = cmd[i + 1]
+        elif arg.startswith("--sleep-idle-seconds="):
+            value = arg.split("=", 1)[1]
+    try:
+        return value is not None and int(value) >= 0
+    except ValueError:
+        return False
+
+
 def parse_flags(cmd: list[str]) -> dict:
     out: dict = {}
     for i, arg in enumerate(cmd):
@@ -242,6 +260,10 @@ class ServerInfo:
     requests_running: int | None = None
     requests_waiting: int | None = None
     kv_cache_usage: float | None = None  # fraction 0-1 of KV-cache pool, not of GPU memory
+    # llama-server only: /props "is_sleeping" (model unloaded by --sleep-idle-seconds). None when not reported.
+    sleeping: bool | None = None
+    # llama-server only: endpoints left out so polling doesn't wake the model or hold off its sleep. Kept out of JSON.
+    skipped: tuple[str, ...] = field(default=(), metadata={"json": False})
     # vLLM only: last token-counter reading, the baseline for the next probe's rates. Kept out of JSON.
     token_sample: TokenSample | None = field(default=None, repr=False, compare=False, metadata={"json": False})
     # internal guard against inferring a singleton from partial API data. Kept out of JSON.
@@ -383,6 +405,22 @@ def server_gauge_text(s: ServerInfo) -> str | None:
     return f"{source} (runtime-reported): requests running {running}, waiting {waiting}, KV-cache pool {kv}"
 
 
+def sleep_note(s: ServerInfo) -> str | None:
+    """Why llama-server slot or gauge readings are missing on purpose, or None when nothing was skipped."""
+    if s.sleeping:
+        return ("llama-server reports it is sleeping (--sleep-idle-seconds): it has unloaded its model until the "
+                "next request. /slots and /metrics are not polled while it sleeps, because /slots would reload "
+                "the model, so busy slots and gauges are unknown.")
+    if not s.skipped:
+        return None
+    note = ("llama-server was started with --sleep-idle-seconds. /slots is not polled, because each request "
+            "restarts its idle timer and the model would never unload, so busy slots are unknown.")
+    if "/metrics" in s.skipped:
+        note += (" /metrics is skipped too: llama.cpp builds before b10519 also count it as activity, and this "
+                 "server reports an older build or none.")
+    return note
+
+
 def vllm_rate_text(s: ServerInfo) -> str | None:
     """One line for vLLM's derived token rates, or None before two usable readings. 0 stays 0."""
     if s.kind != "vllm" or (s.prompt_tok_s is None and s.gen_tok_s is None):
@@ -513,12 +551,24 @@ def foundry_models(response) -> list[dict] | None:
     return [_model_entry(m) for m in response]
 
 
+METRICS_IDLE_SAFE_BUILD = 10519  # first llama.cpp build where GET /metrics doesn't reset the sleep timer
+
+
+def _llama_build(props: dict) -> int | None:
+    """llama.cpp build number from /props build_info ("b12633-abc1234"), or None."""
+    match = re.match(r"b(\d+)-", str(props.get("build_info") or ""))
+    return int(match.group(1)) if match else None
+
+
 def probe_server(port: int, prev: ServerInfo | None = None, key: str | None = None,
-                 kind: str | None = None) -> ServerInfo | None:
+                 kind: str | None = None, sleep_idle: bool = False) -> ServerInfo | None:
     """Read-only GETs. Never calls inference, load or download endpoints.
 
     Returns UNAUTHORIZED when the port answers 401 and no key (or a wrong one) was sent. Probing stops there,
     so a locked server logs one rejected request per probe instead of one per endpoint.
+
+    sleep_idle: the server's command line enables --sleep-idle-seconds. llama-server counts every /slots
+    request as activity, so polling it would keep the model loaded forever; /slots is then never sent.
     """
     base = f"http://127.0.0.1:{port}"
     if kind == "foundry-local":
@@ -563,13 +613,25 @@ def probe_server(port: int, prev: ServerInfo | None = None, key: str | None = No
         else:
             v1 = _get(base + "/v1/models", key=key)
             s.models = llama_server_models(v1, s.model_path) if isinstance(v1, dict) else []
-        slots = _get(base + "/slots", key=key)
+        sleeping = props.get("is_sleeping")
+        s.sleeping = sleeping if isinstance(sleeping, bool) else None
+        # /props and /v1/models never count as activity. /slots always does, and on a sleeping server it
+        # blocks until the model is reloaded. /metrics stopped counting in llama.cpp b10519 (PR #27376);
+        # before that build it was an ordinary task too. A sleeping server's /metrics is a pre-sleep snapshot.
+        build = _llama_build(props)
+        skipped = []
+        if s.sleeping or sleep_idle:
+            skipped.append("/slots")
+        if s.sleeping or (sleep_idle and (build is None or build < METRICS_IDLE_SAFE_BUILD)):
+            skipped.append("/metrics")
+        s.skipped = tuple(skipped)
+        slots = None if "/slots" in skipped else _get(base + "/slots", key=key)
         if isinstance(slots, list) and all(
                 isinstance(slot, dict) and isinstance(slot.get("is_processing"), bool) for slot in slots):
             s.slots_total = len(slots)
             s.slots_busy = sum(1 for slot in slots if slot["is_processing"])
             s.requests_running = s.slots_busy
-        metrics = _get(base + "/metrics", key=key)
+        metrics = None if "/metrics" in skipped else _get(base + "/metrics", key=key)
         if isinstance(metrics, str):
             s.gen_tok_s = _metric(metrics, "predicted_tokens_seconds")
             s.prompt_tok_s = _metric(metrics, "prompt_tokens_seconds")
@@ -613,7 +675,7 @@ class ServerProber:
         return port, kind, origin, hashlib.sha256(key.encode()).digest() if key else None
 
     def get(self, ports: list[int], key: str | None = None, *, kind: str | None = None,
-            origin: object = "process") -> ServerInfo | None:
+            origin: object = "process", sleep_idle: bool = False) -> ServerInfo | None:
         now = time.time()
         for port in ports:
             identity = self._identity(port, key, kind, origin)
@@ -621,7 +683,7 @@ class ServerProber:
             if hit and now - hit[0] < (self.TTL_HIT if hit[1] else self.TTL_MISS):
                 info = hit[1]
             else:
-                info = probe_server(port, self._last.get(identity), key, kind=kind)
+                info = probe_server(port, self._last.get(identity), key, kind=kind, sleep_idle=sleep_idle)
                 if info is UNAUTHORIZED:
                     self._locked.add(identity)
                     self.locked.add(port)
@@ -752,6 +814,8 @@ def build_view(d: ProcDetail, vram: float, shared: float, server: ServerInfo | N
                server_source: str | None = None) -> LlmView:
     v = LlmView(flags=parse_flags(d.cmdline), server=server, host=host,
                 server_source=(server_source or "process") if server else None)
+    if server and server.kind == "llama-server" and (note := sleep_note(server)):
+        v.notes.append(note)
     if server and server.kind == "vllm":
         source = "parent process" if v.server_source == "parent" else "process's own listener"
         v.notes.append(f"vLLM API reported via {source}; model IDs do not prove this process's "
