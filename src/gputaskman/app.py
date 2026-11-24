@@ -924,6 +924,8 @@ class GpuTaskManager(App):
                     st.append(" (parent process; API report, not worker residency)")
                 if sv.n_ctx:
                     st.append(f"  ctx {sv.n_ctx:,}")
+                if sv.sleeping:
+                    st.append("  sleeping", style="bold yellow")
                 if sv.slots_total is not None:
                     busy = "n/a" if sv.slots_busy is None else str(sv.slots_busy)
                     st.append(f"  slots busy {busy}/{sv.slots_total}")

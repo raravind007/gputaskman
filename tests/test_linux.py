@@ -513,6 +513,22 @@ class ContainerTests(unittest.TestCase):
                     self.assertEqual((host["vram_bytes"], host["gpu_pct"]), (memory, 75))
                     self.assertEqual(snap.attributed, memory)
 
+    def test_llama_server_with_sleep_idle_is_never_sent_slots(self):
+        base = "http://127.0.0.1:8080"
+        responses = {
+            base + "/props": {"default_generation_settings": {"n_ctx": 4096}, "is_sleeping": False,
+                              "build_info": "b12633-abc"},
+            base + "/v1/models": {"data": [{"id": "api-only-model"}]},
+            base + "/metrics": "llamacpp:requests_processing 0\n",
+        }
+        with patch("gputaskman.llm._get", side_effect=lambda url, **kw: responses[url]) as get:
+            d = ProcDetail(547, "llama-server", ports=[8080],
+                           cmdline=["llama-server", "-m", "x.gguf", "--sleep-idle-seconds", "300"])
+            snap = self.snapshot(FakeNvml(compute=[proc(9000, 3 * GiB)]), d, prober=ServerProber())
+        self.assertEqual({call.args[0] for call in get.call_args_list}, set(responses))
+        server = to_dict(snap)["processes"][0]["llm"]["server"]
+        self.assertEqual((server["sleeping"], server["requests_running"], server["slots_busy"]), (False, 0, None))
+
     def test_generic_process_with_only_model_hints_is_not_classified_or_probed(self):
         for sources in ([], ["path-arg"], ["installed"]):
             with self.subTest(sources=sources), patch("gputaskman.collector.build_view") as build, \
